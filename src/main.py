@@ -2,12 +2,12 @@ import time
 import signal
 import sys
 
-import config
-import fan
-import tach
-import servo
-import dht11_read
-import camera_track
+import src.config as config
+import src.fan as fan
+import src.tach as tach
+import src.servo as servo
+import src.dht11_read as dht11_read
+import src.camera_track as camera_track
 
 _run = True
 def _sigint(sig, frame):

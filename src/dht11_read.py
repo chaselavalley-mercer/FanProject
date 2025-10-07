@@ -1,6 +1,6 @@
 import Adafruit_DHT as dht
 import time
-import config
+import src.config as config
 
 _sensor = dht.DHT11
 

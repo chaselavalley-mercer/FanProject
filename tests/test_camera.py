@@ -1,5 +1,5 @@
-import camera_track
-import config
+import src.camera_track as camera_track
+import src.config as config
 import cv2
 
 camera_track.init()

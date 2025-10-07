@@ -23,9 +23,9 @@ import signal
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 import cv2
-import config
-import servo
-import camera_track
+import src.config as config
+import src.servo as servo
+import src.camera_track as camera_track
 
 RUN = True
 

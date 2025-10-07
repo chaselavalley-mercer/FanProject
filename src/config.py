@@ -7,6 +7,7 @@ DHT11_PIN = 4
 # Fan behavior
 FAN_PWM_FREQ_HZ = 25000      # PC fans want ~25 kHz
 PULSES_PER_REV = 2           # most 3/4-wire fans
+TACH_GLITCH_FILTER_US = 50  # ignore spikes < 50 µs
 
 # Temperature control (°C)
 TEMP_MIN = 24.0              # fan off at/below this

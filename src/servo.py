@@ -1,5 +1,5 @@
 import RPi.GPIO as GPIO
-import config
+import src.config as config
 
 _initialized = False
 _pwm = None

@@ -1,4 +1,4 @@
-import servo
+import src.servo as servo
 print("Servo: 'a' left 20°, 'd' right 20°, 'q' quit")
 servo.init()
 try:

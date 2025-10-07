@@ -1,5 +1,5 @@
 import cv2
-import config
+import src.config as config
 
 # >>> ADD: picamera2 import <<<
 from picamera2 import Picamera2
