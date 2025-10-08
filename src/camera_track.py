@@ -1,133 +1,150 @@
+# ============================================
+# src/camera_track.py — simple detect + compare
+# ============================================
+
+import time
 import cv2
+from picamera2 import Picamera2
 import config
 
-# >>> ADD: picamera2 import <<<
-from picamera2 import Picamera2
-import numpy as np
-
+# Camera & detector handles
 _cap = None
 _cascade = None
 
-def init():
-    global _cap, _cascade
-    # >>> CHANGE: use Picamera2 instead of VideoCapture <<<
-    _cap = Picamera2()
-    _cap.configure(_cap.create_preview_configuration(
-        main={"size": (config.FRAME_W, config.FRAME_H), "format": "RGB888"}))
-    _cap.start()
-
-    # Keep your existing cascade line if you like cv2.data:
-    # _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-    # If you already placed the XML in your project, you can also use:
-    # from pathlib import Path
-    # cascade_path = Path(__file__).resolve().parent / "assets" / "haarcascades" / "haarcascade_frontalface_default.xml"
-    # _cascade = cv2.CascadeClassifier(str(cascade_path))
-
-    _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
+# --- minimal helper: clamp box into frame
 def _clip_box(b, w, h):
     x, y, ww, hh = [int(v) for v in b]
-    x = max(0, min(x, w - 1))
-    y = max(0, min(y, h - 1))
+    x  = max(0, min(x,  w - 1))
+    y  = max(0, min(y,  h - 1))
     ww = max(1, min(ww, w - x))
     hh = max(1, min(hh, h - y))
     return (x, y, ww, hh)
 
+# --- prefer larger & more centered face
+def _score_face(b, w):
+    x, y, ww, hh = b
+    cx = x + 0.5 * ww
+    size = ww * hh
+    center = 0.5 * w
+    lam = 1.5  # center weight
+    return size - lam * abs(cx - center)
+
+# --- optional contrast equalization for Haar
+def _maybe_clahe(gray):
+    if not getattr(config, "USE_CLAHE", True):
+        return gray
+    clip = getattr(config, "CLAHE_CLIP", 2.0)
+    tile = getattr(config, "CLAHE_TILE", (8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
+    return clahe.apply(gray)
+
+# ------------------------------------------------
+# init(): camera + cascade
+# ------------------------------------------------
+def init():
+    global _cap, _cascade
+    _cap = Picamera2()
+    _cap.configure(_cap.create_preview_configuration(
+        main={
+            "size":   (config.FRAME_W, config.FRAME_H),
+            "format": getattr(config, "CAM_FORMAT", "RGB888")
+        }
+    ))
+    _cap.start()
+    time.sleep(0.2)
+
+    # Face cascade
+    path = getattr(config, "CASCADE_PATH", None)
+    if path:
+        _cascade = cv2.CascadeClassifier(str(path))
+    else:
+        _cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+        )
+
+# ------------------------------------------------
+# step(): detect face -> compare to deadzone -> dx
+# ------------------------------------------------
 def step():
     """
-    Returns (dx, frame, face_box)
-    dx = -1 (face left => move left), 0 (within zone or no face/rate-limit), +1 (face right)
-    face_box = (x,y,w,h) or None
+    Returns:
+      dx:  -1 (face left of deadzone) / 0 (inside) / +1 (right of deadzone)
+      frame: BGR image with HUD drawn
+      face_box: (x,y,w,h) or None
     """
-    global _frame_idx, _tracker, _locked, _lock_count, _lost_count, _last_cx_ema, _last_cmd_ts
-
-    # 1) Grab frame (RGB from Picamera2) -> BGR
+    # grab frame (RGB from Picamera2) -> BGR for OpenCV
     rgb = _cap.capture_array()
     frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = frame.shape[:2]
 
+    # constants from config
+    DETECT_SCALE   = config.DETECT_SCALE
+    DETECT_NEIGHB  = config.DETECT_NEIGHB
+    DETECT_MINSIZE = config.DETECT_MINSIZE
+
+    DEADZONE_PX    = config.FACE_ZONE_PX
+    HYST_MARGIN_PX = config.FACE_HYST_MARGIN_PX
+
+    # 1) detect faces this frame (no skipping, no counters)
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray  = _maybe_clahe(gray)
+    faces = _cascade.detectMultiScale(gray, DETECT_SCALE, DETECT_NEIGHB, minSize=DETECT_MINSIZE)
+
     box = None
-    have_box = False
+    if len(faces) > 0:
+        # pick best (big + centered)
+        cand = max(faces, key=lambda b: _score_face(b, w))
+        box  = _clip_box(cand, w, h)
 
-    # 2) If locked, update tracker; otherwise (occasionally) detect to (re)lock
-    if _locked and _tracker is not None:
-        ok, bb = _tracker.update(frame)
-        if ok:
-            box = _clip_box(bb, w, h)
-            _lost_count = 0
-            have_box = True
-        else:
-            _lost_count += 1
-            if _lost_count >= LOST_FRAMES:
-                _locked = False
-                _tracker = None
-                _lock_count = 0
-                _last_cx_ema = None
-
-    if not _locked and (_frame_idx % DETECT_EVERY_N == 0):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = _cascade.detectMultiScale(gray, DETECT_SCALE, DETECT_NEIGHB, minSize=DETECT_MINSIZE)
-        if len(faces) > 0:
-            # largest face
-            x, y, ww, hh = max(faces, key=lambda b: b[2] * b[3])
-            box = _clip_box((x, y, ww, hh), w, h)
-            _lock_count += 1
-            if _lock_count >= LOCK_FRAMES:
-                # MOSSE is light and stable on Pi Zero 2 W
-                try:
-                    _tracker = cv2.legacy.TrackerMOSSE_create()
-                except AttributeError:
-                    _tracker = cv2.TrackerMOSSE_create()
-                _tracker.init(frame, tuple(box))
-                _locked = True
-                _lost_count = 0
-                have_box = True
-                _last_cx_ema = None
-        else:
-            _lock_count = 0
-
-    _frame_idx += 1
-
-    # 3) Convert box to dx with smoothing, hysteresis, and cooldown
+    # 2) compute dx from horizontal offset vs deadzone
     dx = 0
-    if have_box and box is not None:
+    if box is not None:
         x, y, ww, hh = box
-        cx = x + 0.5 * ww
-        center = 0.5 * w
+        cx_face  = x + 0.5 * ww              # face center x
+        cx_frame = 0.5 * w                   # image center x
+        offset   = cx_face - cx_frame        # signed px (left negative, right positive)
+        threshold = DEADZONE_PX + HYST_MARGIN_PX
 
-        # EMA smoothing to reduce jitter
-        if _last_cx_ema is None:
-            _last_cx_ema = cx
+        # decide: outside deadzone -> move
+        if offset < -threshold:
+            dx = -1
+        elif offset > threshold:
+            dx = +1
         else:
-            _last_cx_ema = (1.0 - EMA_ALPHA) * _last_cx_ema + EMA_ALPHA * cx
+            dx = 0
 
-        offset = _last_cx_ema - center
-
-        # Deadzone + hysteresis to avoid chattering near center
-        if offset < -(DEADZONE_PX + HYST_MARGIN_PX):
-            want = -1
-        elif offset > (DEADZONE_PX + HYST_MARGIN_PX):
-            want = +1
-        else:
-            want = 0
-
-        # Command cooldown so servo doesn’t “buzz”
-        now = time.time()
-        if want != 0 and (now - _last_cmd_ts) >= CMD_COOLDOWN_S:
-            dx = want
-            _last_cmd_ts = now
+        # 3) HUD: show center, deadzone, current face x and threshold
+        # center line
+        cv2.line(frame, (int(cx_frame), 0), (int(cx_frame), h), (255, 255, 255), 1)
+        # deadzone rectangle
+        dz = int(DEADZONE_PX)
+        cv2.rectangle(frame, (int(cx_frame - dz), 0), (int(cx_frame + dz), h), (80, 80, 80), 1)
+        # face box
+        cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
+        # text: show current x and threshold edges
+        left_edge  = cx_frame - threshold
+        right_edge = cx_frame + threshold
+        hud = f"cx_face={cx_face:.0f}  center={cx_frame:.0f}  thr=[{left_edge:.0f},{right_edge:.0f}]  dx={dx}"
+        cv2.putText(frame, hud, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+    else:
+        # no face this frame -> dx=0, draw center/deadzone only
+        cx_frame = 0.5 * w
+        dz = int(DEADZONE_PX)
+        cv2.line(frame, (int(cx_frame), 0), (int(cx_frame), h), (255, 255, 255), 1)
+        cv2.rectangle(frame, (int(cx_frame - dz), 0), (int(cx_frame + dz), h), (80, 80, 80), 1)
+        cv2.putText(frame, "no face", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
     return dx, frame, box
 
-
+# ------------------------------------------------
+# close(): stop camera
+# ------------------------------------------------
 def close():
+    global _cap
     try:
-        # >>> CHANGE: stop Picamera2 instead of cap.release <<<
-        if _cap is not None:
+        if _cap:
             _cap.stop()
-    except:
-        pass
-    cv2.destroyAllWindows()
+    finally:
+        _cap = None
 
 
